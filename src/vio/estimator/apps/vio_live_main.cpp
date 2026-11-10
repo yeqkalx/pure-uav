@@ -6,8 +6,8 @@
 //   - VIO 线程（本文件）：按时间顺序喂 IMU/图像，输出 VisionPose 并发送
 //
 // 时间戳：
-//   - IMU：飞控 HIGHRES_IMU.time_usec（boot 时间，µs）
-//   - 相机：帧到达主机时的 CLOCK_MONOTONIC，用 FcuClock 映射到 IMU 时钟
+//   - IMU：飞控 HIGHRES_IMU.time_usec 去抖后，由 FcuClock 换算为主机 Unix 微秒
+//   - 相机：主机 CLOCK_MONOTONIC / 设备时间先对齐到飞控，再换算到同一 Unix 时间基
 //   - 输出：t_imu = t_cam + timeshift_cam_imu（由 OpenVINS 配置给出）
 //
 // 用法示例：
@@ -33,7 +33,9 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "camera_shm.hpp"
 #include "fcu_clock.hpp"
 #include "live_timing.hpp"
 #include "live_view.hpp"
@@ -72,9 +74,11 @@ void printUsage(const char* argv0) {
         "  --serial DEV        飞控串口（默认 /dev/ttyACM0）\n"
         "  --baud N            波特率（默认 921600）\n"
         "  --config-dir DIR    OpenVINS 配置目录（默认 config/gemini_1920x1080）\n"
-        "  --width N           彩色图宽（默认 1920）\n"
-        "  --height N          彩色图高（默认 1080）\n"
-        "  --fps N             彩色帧率（默认 30）\n"
+        "  --shm NAME          VIO 共享内存通道（默认 /pure_uav_camera_vio）\n"
+        "  --shm-timeout-ms N  等待 camera_server 就绪的超时（默认 5000）\n"
+        "  --width N           期望彩色图宽（默认 1920，仅用于与通道元数据核对）\n"
+        "  --height N          期望彩色图高（默认 1080，仅用于与通道元数据核对）\n"
+        "  --fps N             期望帧率（默认 30，仅用于与通道元数据核对）\n"
         "  --csv-out PATH      VisionPose CSV 输出（默认 out/live_pose.csv）\n"
         "  --tum-out PATH      TUM 轨迹输出（默认 out/live_traj.tum，含所有估计位姿）\n"
         "  --safe-tum-out PATH 只写串口发送成功的位姿（--no-send 时为空），给 RViz 看用\n"
@@ -146,6 +150,8 @@ int main(int argc, char** argv) {
     int width = 1920;
     int height = 1080;
     int fps = 30;
+    std::string shm_vio = pure_uav::camera::kVioChannel;
+    int shm_timeout_ms = 5000;
     std::string csv_out = "out/live_pose.csv";
     std::string tum_out = "out/live_traj.tum";
     std::string safe_tum_out;  // 只记"实际发布出去"的位姿（健康门限通过的那些）
@@ -207,6 +213,14 @@ int main(int argc, char** argv) {
             height = std::stoi(need("--height"));
         } else if (a == "--fps") {
             fps = std::stoi(need("--fps"));
+        } else if (a == "--shm") {
+            shm_vio = need("--shm");
+        } else if (a == "--shm-timeout-ms") {
+            shm_timeout_ms = std::stoi(need("--shm-timeout-ms"));
+            if (shm_timeout_ms < 100 || shm_timeout_ms > 120000) {
+                std::fprintf(stderr, "--shm-timeout-ms 只接受 100..120000\n");
+                return 2;
+            }
         } else if (a == "--csv-out") {
             csv_out = need("--csv-out");
         } else if (a == "--tum-out") {
@@ -420,34 +434,30 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // 3) 相机 + 帧队列
+    // 3) 共享内存 VIO 通道 + 帧队列
+    // 相机由 camera_server 独占采集，本进程不再创建 ob::Pipeline。
+    // 曝光/测光/深度/聚合等参数统一在 config/camera.yaml 配置；旧 CLI 仍可解析
+    // 以兼容既有脚本，这里只保留分辨率/帧率用于与通道元数据核对。
     std::mutex frame_mtx;
     std::deque<FrameItem> frame_q;
     constexpr size_t kMaxFrameQueue = 5;
     uint64_t dropped_frames = 0;
 
-    pure_uav::OrbbecCamera camera;
-    pure_uav::OrbbecCamera::Config cam_cfg;
-    cam_cfg.width = width;
-    cam_cfg.height = height;
-    cam_cfg.fps = fps;
-    cam_cfg.use_depth = enable_depth;
-    cam_cfg.aggregate_mode = aggregate_mode;
-    cam_cfg.exposure = exposure;
-    cam_cfg.gain = gain;
-    cam_cfg.auto_exposure = auto_exposure;
-    cam_cfg.tune_expected_rate_dps = tune_expected_rate;
-    cam_cfg.tune_blur_budget_px = tune_blur_budget;
-    cam_cfg.tune_max_gain = tune_max_gain;
-    cam_cfg.tune_allow_blur = tune_allow_blur;
-    cam_cfg.tune_strict_blur = strict_blur;
-    if (max_exposure_ms > 0) {
-        cam_cfg.tune_max_exposure_ms = max_exposure_ms;
-    }
-    cam_cfg.tune_allow_dark = tune_allow_dark;
-    if (no_tune) {
-        cam_cfg.auto_tune_exposure = false;
-    }
+    (void)enable_depth;
+    (void)aggregate_mode;
+    (void)strict_blur;
+    (void)max_exposure_ms;
+    (void)exposure;
+    (void)gain;
+    (void)auto_exposure;
+    (void)tune_expected_rate;
+    (void)tune_blur_budget;
+    (void)tune_max_gain;
+    (void)tune_allow_blur;
+    (void)tune_allow_dark;
+    (void)no_tune;
+
+    pure_uav::camera::ShmChannelReader vio_reader;
 
     // 图像诊断：每秒打一行亮度和 FAST 特征数。
     // VIO 出问题时，"场景太暗/没纹理" 和 "滤波器不更新" 从日志上分不出来，这两个数能分开。
@@ -520,7 +530,7 @@ int main(int argc, char** argv) {
                             }
                         }
                     }
-                    const auto total = static_cast<size_t>((depth_mm.rows / 8 + 1) * (depth_mm.cols / 8 + 1));
+                    const auto total = static_cast<size_t>(((depth_mm.rows / 8) + 1) * ((depth_mm.cols / 8) + 1));
                     depth_valid_ratio = total ? static_cast<double>(vals.size()) / total : 0.0;
                     if (!vals.empty()) {
                         std::nth_element(vals.begin(), vals.begin() + vals.size() / 2, vals.end());
@@ -610,16 +620,70 @@ int main(int argc, char** argv) {
         }
     };
 
-    if (!camera.start(cam_cfg, frame_cb, &err)) {
-        std::fprintf(stderr, "相机启动失败: %s\n", err.c_str());
+    if (!vio_reader.open(shm_vio, pure_uav::camera::ChannelType::vio, shm_timeout_ms, &err)) {
+        std::fprintf(stderr, "连接相机服务 VIO 通道失败: %s\n", err.c_str());
         link.stop();
         return 1;
     }
-    const auto cam_depth = camera.depthInfo();
+    const auto& stream = vio_reader.streamMeta();
+    if ((stream.width != 0 && static_cast<int>(stream.width) != width) || (stream.height != 0 && static_cast<int>(stream.height) != height) || (stream.fps != 0 && static_cast<int>(stream.fps) != fps)) {
+        std::fprintf(stderr, "[WARN] 通道分辨率 %ux%u@%u 与本进程期望 %dx%d@%d 不一致；VIO 标定以 camera_server 配置为准\n", stream.width, stream.height, stream.fps, width, height, fps);
+    }
+
+    // 深度内参/外参过去来自 OrbbecCamera::depthInfo()，现在由通道静态元数据提供。
+    pure_uav::OrbbecCamera::DepthInfo cam_depth;
+    cam_depth.fx = stream.fx;
+    cam_depth.fy = stream.fy;
+    cam_depth.cx = stream.cx;
+    cam_depth.cy = stream.cy;
+    cam_depth.width = static_cast<int>(stream.depth_width);
+    cam_depth.height = static_cast<int>(stream.depth_height);
+    for (int k = 0; k < 9; ++k) {
+        cam_depth.R_c2d[k] = stream.R_c2d[k];
+    }
+    for (int k = 0; k < 3; ++k) {
+        cam_depth.t_mm[k] = stream.t_mm[k];
+    }
     const double depth_t_m[3] = {cam_depth.t_mm[0] * 1e-3, cam_depth.t_mm[1] * 1e-3, cam_depth.t_mm[2] * 1e-3};
     if (use_depth_init && !cam_depth.valid()) {
         std::fprintf(stderr, "[WARN] 请求了深度初始化，但深度内参不可用，本轮不会注入深度\n");
     }
+
+    // 读取线程：把共享内存帧还原成 cv::Mat 后交给原有 frame_cb。
+    // frame_cb 内部已 clone，因此这里零拷贝包裹 payload 是安全的；
+    // VIO 线程、FcuClock、imuCoversImage、feedImage、MAVLink 输出全部保持原样。
+    std::atomic<bool> capture_running{true};
+    std::atomic<bool> capture_failed{false};
+    std::thread capture_thread([&] {
+        pure_uav::camera::FrameMeta meta;
+        std::vector<uint8_t> payload;
+        uint64_t session = 0;
+        uint64_t generation = 0;
+        const int depth_w = static_cast<int>(stream.depth_width);
+        const int depth_h = static_cast<int>(stream.depth_height);
+        while (capture_running.load() && !g_stop.load()) {
+            if (vio_reader.readLatest(meta, payload, session, generation)) {
+                const size_t total = static_cast<size_t>(meta.gray_bytes) + meta.depth_bytes;
+                if (meta.gray_bytes != 0 && meta.width > 0 && meta.height > 0 && payload.size() >= total) {
+                    cv::Mat gray(static_cast<int>(meta.height), static_cast<int>(meta.width), CV_8UC1, payload.data());
+                    cv::Mat depth_mm;
+                    if (meta.depth_bytes != 0 && depth_w > 0 && depth_h > 0 && meta.depth_bytes >= static_cast<size_t>(depth_w) * depth_h * 2U) {
+                        depth_mm = cv::Mat(depth_h, depth_w, CV_16UC1, payload.data() + meta.gray_bytes);
+                    }
+                    // 第 4 参数沿用 SDK 主机系统时间，保持 --cam-ts device 的既有语义。
+                    frame_cb(gray, depth_mm, meta.host_ns, meta.sys_us, meta.depth_device_us);
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!vio_reader.writerAlive()) {
+                std::fprintf(stderr, "[WARN] camera_server 心跳超时，VIO 消费者退出（由外部托管方负责重启）\n");
+                capture_failed.store(true);
+                break;
+            }
+        }
+        capture_running.store(false);
+    });
 
     // 4) 输出
     pure_uav::PoseLogger logger;
@@ -629,7 +693,12 @@ int main(int argc, char** argv) {
     }
     if (!logger.open(csv_out, tum_out)) {
         std::fprintf(stderr, "无法打开输出文件\n");
-        camera.stop();
+        g_stop.store(true);
+        capture_running.store(false);
+        if (capture_thread.joinable()) {
+            capture_thread.join();
+        }
+        vio_reader.close();
         link.stop();
         return 1;
     }
@@ -707,7 +776,7 @@ int main(int argc, char** argv) {
             std::printf("[rec] 录制到 %s（cam0/*.png + depth/*.png + images.csv + imu.csv）\n", rec_dir.c_str());
             // 深度元数据：回放时要用它把彩色像素投到深度图上取深度
             {
-                const auto di = camera.depthInfo();
+                const auto& di = cam_depth;  // 通道静态元数据，等价于此前的 camera.depthInfo()
                 std::FILE* dm = std::fopen((rec_dir + "/depth_meta.txt").c_str(), "w");
                 if (dm != nullptr) {
                     if (di.valid()) {
@@ -729,7 +798,7 @@ int main(int argc, char** argv) {
                 }
             }
             std::fflush(stdout);
-            rec_thread = std::thread([&]() {
+            rec_thread = std::thread([&] {
                 const std::vector<int> png_params{cv::IMWRITE_PNG_COMPRESSION, 1};
                 while (true) {
                     std::tuple<cv::Mat, cv::Mat, uint64_t> item_frame;
@@ -771,7 +840,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::thread vio_thread([&]() {
+    std::thread vio_thread([&] {
         pure_uav::FcuClock clock;
         std::optional<FrameItem> pending;
         pure_uav::ImuTimestampFilter imu_timestamp_filter;
@@ -952,14 +1021,20 @@ int main(int argc, char** argv) {
                     }
                 }
                 last_raw_imu_us = imu_item.imu.timestamp_us;
+                const uint64_t fed_fcu_us = imu_feed.timestamp_us;
+                uint64_t raw_unix_us = 0;
+                if (!clock.fcuToUnixUs(fed_fcu_us, imu_feed.timestamp_us) || !clock.fcuToUnixUs(imu_item.imu.timestamp_us, raw_unix_us)) {
+                    ++imu_skipped;
+                    continue;
+                }
                 estimator.feedImu(imu_feed);
-                last_fed_imu_us = imu_feed.timestamp_us;
+                last_fed_imu_us = fed_fcu_us;  // 图像覆盖判定仍使用原始 FCU 时钟域
                 if (rec_imu_csv) {
                     // 录"实际喂给估计器的时间戳"（= 去抖后的），这样回放能 1:1 复现实时行为。
                     std::fprintf(rec_imu_csv, "%llu,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n", static_cast<unsigned long long>(imu_feed.timestamp_us), imu_item.imu.gx, imu_item.imu.gy, imu_item.imu.gz, imu_item.imu.ax, imu_item.imu.ay, imu_item.imu.az);
                 }
                 if (imu_log) {
-                    std::fprintf(imu_log, "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", static_cast<unsigned long long>(imu_item.imu.timestamp_us), imu_item.imu.ax, imu_item.imu.ay, imu_item.imu.az, imu_item.imu.gx, imu_item.imu.gy, imu_item.imu.gz);
+                    std::fprintf(imu_log, "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", static_cast<unsigned long long>(raw_unix_us), imu_item.imu.ax, imu_item.imu.ay, imu_item.imu.az, imu_item.imu.gx, imu_item.imu.gy, imu_item.imu.gz);
                 }
                 did_work = true;
             }
@@ -1045,14 +1120,21 @@ int main(int argc, char** argv) {
                                 depth_fcu_us = static_cast<uint64_t>(d);
                             }
                         }
-                        if (use_depth_init && !pending->depth.empty() && cam_depth.valid()) {
-                            estimator.setDepthImage(pending->depth, depth_fcu_us, cam_depth.fx, cam_depth.fy, cam_depth.cx, cam_depth.cy, cam_depth.R_c2d, depth_t_m);
+                        uint64_t image_unix_us = 0;
+                        uint64_t depth_unix_us = 0;
+                        if (!clock.fcuToUnixUs(fcu_us, image_unix_us) || !clock.fcuToUnixUs(depth_fcu_us, depth_unix_us)) {
+                            pending.reset();
+                            stats_drop_no_clock.fetch_add(1);
+                            continue;
                         }
-                        estimator.feedImage(pending->gray, fcu_us);
+                        if (use_depth_init && !pending->depth.empty() && cam_depth.valid()) {
+                            estimator.setDepthImage(pending->depth, depth_unix_us, cam_depth.fx, cam_depth.fy, cam_depth.cx, cam_depth.cy, cam_depth.R_c2d, depth_t_m);
+                        }
+                        estimator.feedImage(pending->gray, image_unix_us);
                         if (rec_images_csv) {
                             std::scoped_lock lk(rec_mtx);
                             if (rec_q.size() < 300) {
-                                rec_q.emplace_back(pending->gray, pending->depth, fcu_us);
+                                rec_q.emplace_back(pending->gray, pending->depth, image_unix_us);
                             }
                         }
                         const int64_t frame_host_ns = pending->host_ns;  // 位姿年龄统计用
@@ -1366,8 +1448,8 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (!camera.running()) {
-            std::fprintf(stderr, "[WARN] 相机线程已停止（掉线/异常），退出\n");
+        if (!capture_running.load() || capture_failed.load()) {
+            std::fprintf(stderr, "[WARN] camera_server 帧通道已停止（掉线/异常），退出\n");
             break;
         }
         if (duration > 0.0) {
@@ -1380,7 +1462,11 @@ int main(int argc, char** argv) {
     g_stop.store(true);
 
     vio_thread.join();
-    camera.stop();
+    capture_running.store(false);
+    if (capture_thread.joinable()) {
+        capture_thread.join();
+    }
+    vio_reader.close();
     link.stop();
     logger.close();
     safe_logger.close();
